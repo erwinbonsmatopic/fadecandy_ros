@@ -59,6 +59,7 @@ struct Color
 //! LEDs are left dark.
 //!
 std::vector<std::vector<unsigned char>> makeVideoUsbPackets(const std::vector<std::vector<Color>>& led_array_colors);
+std::vector<std::vector<unsigned char>> makeVideoUsbPacketsImproved(const std::vector<std::vector<Color>>& led_array_colors);
 
 //!
 //! \brief makeLookupTablePackets Create USB packets for a simple color

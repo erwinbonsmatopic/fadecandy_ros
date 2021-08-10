@@ -33,7 +33,6 @@
  */
 
 #include <algorithm>
-#include <libusb-1.0/libusb.h>
 #include <list>
 #include <math.h>
 #include <stdexcept>
@@ -42,7 +41,6 @@
 
 namespace fadecandy_driver
 {
-constexpr int LEDS_PER_PACKET = 21;
 constexpr int LOOKUP_VALUES_PER_PACKET = 31;
 constexpr int LOOKUP_VALUES_PER_CHANNEL = 257;
 constexpr int USB_PACKET_SIZE = 64;
@@ -51,6 +49,10 @@ constexpr int PACKET_TYPE_LUT = 0x40;
 constexpr int FINAL_PACKET_BIT = 0x20;
 constexpr int LEDS_PER_STRIP = 64;
 constexpr int NUM_STRIPS = 8;
+constexpr int LEDS_PER_PACKET = (USB_PACKET_SIZE - 1) / 3;
+
+constexpr int NUM_FULL_PACKETS = (NUM_STRIPS * LEDS_PER_STRIP) / LEDS_PER_PACKET;
+constexpr int LEDS_IN_LAST_PACKET = (NUM_STRIPS * LEDS_PER_STRIP) % LEDS_PER_PACKET;
 
 Color::Color(int r, int g, int b) : r_(r), g_(g), b_(b)
 {
@@ -77,13 +79,15 @@ std::vector<unsigned char> intToCharArray(int in, const size_t bytes_per_int)
 
 std::vector<std::vector<unsigned char>> makeVideoUsbPackets(const std::vector<std::vector<Color>>& led_array_colors)
 {
+  // Converts 2D array to 1D array, with extra null values
+  // Note: This loop and the all_led_colors memory allocation can be avoided.
   int led_index = 0;
   std::vector<Color> all_led_colors(LEDS_PER_STRIP * NUM_STRIPS, { 0, 0, 0 });
   for (size_t i = 0; i < led_array_colors.size(); i++)
   {
     for (size_t j = 0; j < led_array_colors[i].size(); j++)
     {
-      led_index = (i * LEDS_PER_STRIP) + j;
+      led_index = (i * LEDS_PER_STRIP) + j; // Note: led_index++ is faster
       all_led_colors[led_index] = led_array_colors[i][j];
     }
   }
@@ -93,17 +97,24 @@ std::vector<std::vector<unsigned char>> makeVideoUsbPackets(const std::vector<st
 
   while (all_led_colors.size() > 0)
   {
+    // Color_bytes is allocated for each iteration of the loop. It's faster to declare this
+    // temporary data structure once, outside the loop. Or even better, to not use it at all.
     std::vector<int> color_bytes;
     std::vector<unsigned char> packet;
 
     if (all_led_colors.size() < LEDS_PER_PACKET)
     {
+      // Last packet, copy remaining entries
       packet_leds.assign(all_led_colors.begin(), all_led_colors.end());
       all_led_colors.erase(all_led_colors.begin(), all_led_colors.end());
     }
     else
     {
+      // Copy LEDS_PER_PACKET entries
       packet_leds.assign(all_led_colors.begin(), all_led_colors.begin() + LEDS_PER_PACKET);
+      // Note: erasing elements from start of vector is a relatively expensive operation and best
+      // avoided. Could instead use index/iterator to track which elements have been consumed
+      // transferred
       all_led_colors.erase(all_led_colors.begin(), all_led_colors.begin() + LEDS_PER_PACKET);
     }
 
@@ -120,6 +131,7 @@ std::vector<std::vector<unsigned char>> makeVideoUsbPackets(const std::vector<st
       color_bytes.push_back(packet_leds[i].b_);
     }
     // construnt USB packet and leave the first byte for the control byte
+    // Pack packet with zeroes
     if ((USB_PACKET_SIZE - 1) - color_bytes.size() > 0)
     {
       int j = (USB_PACKET_SIZE - 1) - color_bytes.size();
@@ -129,6 +141,9 @@ std::vector<std::vector<unsigned char>> makeVideoUsbPackets(const std::vector<st
       }
     }
 
+    // Convert ints to char. However, as long as bytes_per_int is one this relatively expensive
+    // loop (with function invocation and two dynamic memory allocations) per iteration can be
+    // avoided.
     for (size_t i = 0; i < color_bytes.size(); i++)
     {
       int bytes_per_int = 1;
@@ -138,6 +153,8 @@ std::vector<std::vector<unsigned char>> makeVideoUsbPackets(const std::vector<st
     }
 
     // add control byte
+    // Note: This is an expensive operation. It needlessly shifts all entries in the array.
+    // The control byte should therefore be added before adding the other data.
     packet.insert(packet.begin(), static_cast<unsigned char>(control));
 
     if (packet.size() != USB_PACKET_SIZE)
@@ -146,6 +163,77 @@ std::vector<std::vector<unsigned char>> makeVideoUsbPackets(const std::vector<st
     }
     packets.push_back(packet);
   }
+  return packets;
+}
+
+
+std::vector<std::vector<unsigned char>> makeVideoUsbPacketsImproved(
+  const std::vector<std::vector<Color>>& led_array_colors
+) {
+  std::vector<std::vector<unsigned char>> packets;
+  packets.reserve(NUM_FULL_PACKETS + 1);
+
+  int i = 0, j = 0;
+  while (packets.size() < NUM_FULL_PACKETS) {
+    std::vector<unsigned char> packet(USB_PACKET_SIZE, 0);
+    int leds_in_packet = 0;
+
+    char control = static_cast<unsigned char>(packets.size() | PACKET_TYPE_VIDEO);
+    packet[0] = control;
+
+    while (leds_in_packet < LEDS_PER_PACKET) {
+      // Copy actual colors from current strip
+      int num_colors_to_copy_from_strip = std::min(
+        LEDS_PER_PACKET - leds_in_packet, static_cast<int>(led_array_colors[i].size()) - j
+      );
+      int p = leds_in_packet * 3;
+      while (--num_colors_to_copy_from_strip >= 0) {
+        auto color = led_array_colors[i][j];
+        packet[++p] = static_cast<unsigned char>(color.r_);
+        packet[++p] = static_cast<unsigned char>(color.g_);
+        packet[++p] = static_cast<unsigned char>(color.b_);
+        ++leds_in_packet;
+        ++j;
+      }
+
+      int num_zeroes_to_copy_from_strip = std::min(LEDS_PER_PACKET - leds_in_packet, LEDS_PER_STRIP - j);
+      // Nothing needs copying. Packet is pre-populated with zeroes
+      j += num_zeroes_to_copy_from_strip;
+      leds_in_packet += num_zeroes_to_copy_from_strip;
+
+      if (j == LEDS_PER_STRIP) {
+        ++i;
+        j = 0;
+      }
+    }
+
+    packets.push_back(packet);
+  }
+
+  // Create last packet
+  {
+    std::vector<unsigned char> packet(USB_PACKET_SIZE, 0);
+
+    char control = static_cast<unsigned char>(packets.size() | PACKET_TYPE_VIDEO | FINAL_PACKET_BIT);
+    packet[0] = control;
+
+    // Copy actual colors from current strip
+    int num_colors_to_copy_from_strip = std::min(
+      LEDS_PER_PACKET, static_cast<int>(led_array_colors[i].size()) - j
+    );
+    int p = 0;
+
+    while (--num_colors_to_copy_from_strip >= 0) {
+      auto color = led_array_colors[i][j];
+      packet[++p] = static_cast<unsigned char>(color.r_);
+      packet[++p] = static_cast<unsigned char>(color.g_);
+      packet[++p] = static_cast<unsigned char>(color.b_);
+      ++j;
+    }
+
+    packets.push_back(packet);
+  }
+
   return packets;
 }
 
